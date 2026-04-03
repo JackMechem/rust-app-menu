@@ -1,0 +1,10 @@
+[package]
+name = "rust-app-menu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced = "0.14.0"
+iced_layershell = "0.17.1"
+interprocess = { version = "2", features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync"] }
