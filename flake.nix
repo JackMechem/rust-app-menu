@@ -39,10 +39,19 @@
           pkg-config
           openssl
         ];
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter =
+            path: type:
+            let
+              baseName = builtins.baseNameOf path;
+            in
+            pkgs.lib.cleanSourceFilter path type && baseName != "target" && baseName != "result";
+        };
         rust-app-menu = pkgs.rustPlatform.buildRustPackage {
           pname = "rust-app-menu";
           version = "0.1.0";
-          src = pkgs.lib.cleanSource ./.;
+          inherit src;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = with pkgs; [
             pkg-config
@@ -61,7 +70,6 @@
         };
       in
       {
-
         packages.default = rust-app-menu;
         packages.rust-app-menu = rust-app-menu;
         apps.default = {
