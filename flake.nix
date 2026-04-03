@@ -21,7 +21,6 @@
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
-
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [
             "rust-src"
@@ -30,41 +29,31 @@
             "rustfmt"
           ];
         };
-
         dlopenLibs = with pkgs; [
           libxkbcommon
           vulkan-loader
           wayland
         ];
-
         buildDeps = with pkgs; [
           wayland
           pkg-config
           openssl
         ];
-
-        # The actual package
         rust-app-menu = pkgs.rustPlatform.buildRustPackage {
           pname = "rust-app-menu";
           version = "0.1.0";
-          src = ./.;
-
+          src = pkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
-
           nativeBuildInputs = with pkgs; [
             pkg-config
             wayland-scanner
+            makeWrapper
           ];
-
           buildInputs = buildDeps ++ dlopenLibs;
-
-          # Patch the rpath so dlopen finds wayland/vulkan at runtime
           postFixup = ''
-            patchelf \
-              --set-rpath "${pkgs.lib.makeLibraryPath dlopenLibs}" \
-              $out/bin/rust-app-menu
+            wrapProgram $out/bin/rust-app-menu \
+              --set LD_LIBRARY_PATH "${pkgs.lib.makeLibraryPath dlopenLibs}"
           '';
-
           env = {
             WAYLAND_PROTOCOLS = "${pkgs.wayland-protocols}/share/wayland-protocols";
             WAYLAND_SCANNER = "${pkgs.wayland-scanner}/bin/wayland-scanner";
@@ -72,16 +61,12 @@
         };
       in
       {
-        # `nix build`
         packages.default = rust-app-menu;
         packages.rust-app-menu = rust-app-menu;
-
-        # `nix run`
         apps.default = {
           type = "app";
           program = "${rust-app-menu}/bin/rust-app-menu";
         };
-
         devShells.default = pkgs.mkShell {
           name = "app-launcher-dev";
           nativeBuildInputs = with pkgs; [
@@ -89,12 +74,17 @@
             pkg-config
             cargo-watch
             cargo-expand
+            sccache
+            mold
           ];
           buildInputs = buildDeps ++ dlopenLibs;
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath dlopenLibs;
           WAYLAND_PROTOCOLS = "${pkgs.wayland-protocols}/share/wayland-protocols";
+          RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
           shellHook = ''
             export WAYLAND_SCANNER="${pkgs.wayland-scanner}/bin/wayland-scanner"
+            export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
+            export SCCACHE_CACHE_SIZE="10G"
             echo "🚀 app-launcher dev shell ready"
             echo "   rust: $(rustc --version)"
             echo "   cargo: $(cargo --version)"
