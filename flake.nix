@@ -61,6 +61,7 @@
         };
       in
       {
+
         packages.default = rust-app-menu;
         packages.rust-app-menu = rust-app-menu;
         apps.default = {
