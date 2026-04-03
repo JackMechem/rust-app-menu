@@ -1,3 +1,4 @@
+use iced::futures::SinkExt;
 use iced::keyboard::key::Named;
 use iced::widget::{Id, button, column, container, scrollable, text, text_input};
 use iced::{Alignment, Color, Element, Event, Length, Task as Command, event, keyboard};
@@ -6,10 +7,13 @@ use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
 use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock, mpsc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const INPUT_ID: &str = "search";
 const SOCKET_NAME: &str = "rust-app-menu.sock";
+
+static SHOW_RX: OnceLock<Mutex<mpsc::Receiver<()>>> = OnceLock::new();
 
 fn socket_path() -> String {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
@@ -17,34 +21,40 @@ fn socket_path() -> String {
     format!("{}/{}", runtime_dir, SOCKET_NAME)
 }
 
-// --- Socket helpers ---
-
 async fn try_show_existing() -> bool {
     match tokio::net::UnixStream::connect(socket_path()).await {
         Ok(mut conn) => {
+            eprintln!("[client] Found existing instance, sending show signal");
             let _ = conn.write_all(b"show").await;
             true
         }
-        Err(_) => false,
+        Err(e) => {
+            eprintln!("[client] No existing instance ({}), starting daemon", e);
+            false
+        }
     }
 }
 
-async fn listen_for_show(sender: tokio::sync::mpsc::UnboundedSender<()>) {
+async fn listen_for_show(sender: mpsc::Sender<()>) {
     let path = socket_path();
     let _ = std::fs::remove_file(&path);
 
+    eprintln!("[daemon] Binding socket at {}", path);
     let listener = match tokio::net::UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Failed to bind socket: {}", e);
+            eprintln!("[daemon] Failed to bind socket: {}", e);
             return;
         }
     };
 
+    eprintln!("[daemon] Listening for show signals...");
     loop {
         if let Ok((mut conn, _)) = listener.accept().await {
+            eprintln!("[daemon] Got connection");
             let mut buf = [0u8; 8];
             if conn.read(&mut buf).await.is_ok() {
+                eprintln!("[daemon] Received show signal, notifying iced");
                 let _ = sender.send(());
             }
         }
@@ -199,12 +209,12 @@ struct Launcher {
     query: String,
     all_apps: Vec<App>,
     visible: bool,
-    show_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
 }
 
 impl Launcher {
     fn new() -> (Self, Command<Message>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel();
+        SHOW_RX.set(Mutex::new(rx)).ok();
 
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
@@ -218,7 +228,6 @@ impl Launcher {
             query: String::new(),
             all_apps: load_apps(),
             visible: true,
-            show_rx: rx,
         };
         (state, Command::none())
     }
@@ -256,16 +265,28 @@ fn subscription(_: &Launcher) -> iced::Subscription<Message> {
     let event_sub = event::listen().map(Message::IcedEvent);
 
     let show_sub = iced::Subscription::run(|| {
-        iced::stream::channel(
-            1,
-            |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-                loop {
-                    iced::futures::future::ready(()).await;
-                    let _ = output.try_send(Message::Show);
+    iced::stream::channel(
+        1,
+        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            loop {
+                // Use a oneshot to bridge blocking recv into async
+                let (tx, rx) = iced::futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let got = SHOW_RX
+                        .get()
+                        .map(|rx| rx.lock().unwrap().recv().is_ok())
+                        .unwrap_or(false);
+                    let _ = tx.send(got);
+                });
+
+                if rx.await.unwrap_or(false) {
+                    eprintln!("[sub] Got show signal, sending Message::Show");
+                    let _ = output.send(Message::Show).await;
                 }
-            },
-        )
-    });
+            }
+        },
+    )
+});
 
     iced::Subscription::batch([event_sub, show_sub])
 }
@@ -273,18 +294,17 @@ fn subscription(_: &Launcher) -> iced::Subscription<Message> {
 fn update(launcher: &mut Launcher, message: Message) -> Command<Message> {
     match message {
         Message::Show => {
-            if launcher.show_rx.try_recv().is_ok() {
-                launcher.visible = true;
-                launcher.query.clear();
-                return Command::done(Message::AnchorSizeChange(Anchor::empty(), (600, 400)));
-            }
-            Command::none()
+            eprintln!("[iced] Show signal received, making visible");
+            launcher.visible = true;
+            launcher.query.clear();
+            Command::done(Message::AnchorSizeChange(Anchor::empty(), (600, 400)))
         }
 
         Message::IcedEvent(Event::Keyboard(keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(Named::Escape),
             ..
         })) => {
+            eprintln!("[iced] Hiding, sending AnchorSizeChange 1x1");
             launcher.visible = false;
             launcher.query.clear();
             Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1)))
