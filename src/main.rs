@@ -5,27 +5,24 @@ use iced_layershell::application;
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
 use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
-use interprocess::local_socket::{
-    GenericNamespaced, ListenerOptions, ToNsName,
-    traits::tokio::{Listener, Stream},
-    tokio::prelude::*,
-};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const INPUT_ID: &str = "search";
 const SOCKET_NAME: &str = "rust-app-menu.sock";
 
+fn socket_path() -> String {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| "/tmp".to_string());
+    format!("{}/{}", runtime_dir, SOCKET_NAME)
+}
+
 // --- Socket helpers ---
 
 async fn try_show_existing() -> bool {
-    let name = match SOCKET_NAME.to_ns_name::<GenericNamespaced>() {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    match LocalSocketStream::connect(name).await {
+    match tokio::net::UnixStream::connect(socket_path()).await {
         Ok(mut conn) => {
-            let _ = AsyncWriteExt::write_all(&mut conn, b"show").await;
+            let _ = conn.write_all(b"show").await;
             true
         }
         Err(_) => false,
@@ -33,24 +30,21 @@ async fn try_show_existing() -> bool {
 }
 
 async fn listen_for_show(sender: tokio::sync::mpsc::UnboundedSender<()>) {
-    // Clean up any leftover socket from a previous crashed run
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        let _ = std::fs::remove_file(format!("{}/{}", runtime_dir, SOCKET_NAME));
-    }
+    let path = socket_path();
+    let _ = std::fs::remove_file(&path);
 
-    let name = match SOCKET_NAME.to_ns_name::<GenericNamespaced>() {
-        Ok(n) => n,
-        Err(_) => return,
-    };
-    let opts = ListenerOptions::new().name(name);
-    let listener = match opts.create_tokio() {
+    let listener = match tokio::net::UnixListener::bind(&path) {
         Ok(l) => l,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("Failed to bind socket: {}", e);
+            return;
+        }
     };
+
     loop {
-        if let Ok(mut conn) = Listener::accept(&listener).await {
+        if let Ok((mut conn, _)) = listener.accept().await {
             let mut buf = [0u8; 8];
-            if AsyncReadExt::read(&mut conn, &mut buf).await.is_ok() {
+            if conn.read(&mut buf).await.is_ok() {
                 let _ = sender.send(());
             }
         }
