@@ -33,6 +33,11 @@ async fn try_show_existing() -> bool {
 }
 
 async fn listen_for_show(sender: tokio::sync::mpsc::UnboundedSender<()>) {
+    // Clean up any leftover socket from a previous crashed run
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let _ = std::fs::remove_file(format!("{}/{}", runtime_dir, SOCKET_NAME));
+    }
+
     let name = match SOCKET_NAME.to_ns_name::<GenericNamespaced>() {
         Ok(n) => n,
         Err(_) => return,
@@ -277,6 +282,7 @@ fn update(launcher: &mut Launcher, message: Message) -> Command<Message> {
             if launcher.show_rx.try_recv().is_ok() {
                 launcher.visible = true;
                 launcher.query.clear();
+                return Command::done(Message::AnchorSizeChange(Anchor::empty(), (600, 400)));
             }
             Command::none()
         }

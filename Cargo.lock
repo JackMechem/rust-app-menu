@@ -2658,6 +2658,7 @@ dependencies = [
  "iced",
  "iced_layershell",
  "interprocess",
+ "libc",
  "tokio",
 ]
 
