@@ -297,7 +297,10 @@ fn update(launcher: &mut Launcher, message: Message) -> Command<Message> {
             eprintln!("[iced] Show signal received, making visible");
             launcher.visible = true;
             launcher.query.clear();
-            Command::done(Message::AnchorSizeChange(Anchor::empty(), (600, 400)))
+            Command::batch([
+                Command::done(Message::AnchorSizeChange(Anchor::empty(), (600, 400))),
+                Command::done(Message::KeyboardInteractivityChange(KeyboardInteractivity::Exclusive)),
+            ])
         }
 
         Message::IcedEvent(Event::Keyboard(keyboard::Event::KeyPressed {
@@ -307,7 +310,10 @@ fn update(launcher: &mut Launcher, message: Message) -> Command<Message> {
             eprintln!("[iced] Hiding, sending AnchorSizeChange 1x1");
             launcher.visible = false;
             launcher.query.clear();
-            Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1)))
+            Command::batch([
+                Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1))),
+                Command::done(Message::KeyboardInteractivityChange(KeyboardInteractivity::None)),
+            ])
         }
 
         Message::IcedEvent(Event::Keyboard(keyboard::Event::KeyPressed {
@@ -318,7 +324,10 @@ fn update(launcher: &mut Launcher, message: Message) -> Command<Message> {
                 launch(&app.exec.clone());
                 launcher.visible = false;
                 launcher.query.clear();
-                return Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1)));
+                return Command::batch([
+                    Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1))),
+                    Command::done(Message::KeyboardInteractivityChange(KeyboardInteractivity::None)),
+                ]);
             }
             Command::none()
         }
@@ -350,13 +359,19 @@ fn update(launcher: &mut Launcher, message: Message) -> Command<Message> {
             launch(&exec);
             launcher.visible = false;
             launcher.query.clear();
-            Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1)))
+            Command::batch([
+                Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1))),
+                Command::done(Message::KeyboardInteractivityChange(KeyboardInteractivity::None)),
+            ])
         }
 
         Message::Close => {
             launcher.visible = false;
             launcher.query.clear();
-            Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1)))
+            Command::batch([
+                Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1))),
+                Command::done(Message::KeyboardInteractivityChange(KeyboardInteractivity::None)),
+            ])
         }
 
         _ => unreachable!(),
@@ -426,7 +441,7 @@ fn main() -> Result<(), iced_layershell::Error> {
                 anchor: Anchor::empty(),
                 exclusive_zone: 0,
                 layer: Layer::Overlay,
-                keyboard_interactivity: KeyboardInteractivity::OnDemand,
+                keyboard_interactivity: KeyboardInteractivity::Exclusive,
                 ..Default::default()
             },
             ..Default::default()
