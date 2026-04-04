@@ -1,11 +1,13 @@
 use iced::futures::SinkExt;
 use iced::keyboard::key::Named;
 use iced::widget::{Id, button, column, container, scrollable, text, text_input};
+use iced::window::Id as WindowId;
 use iced::{Alignment, Color, Element, Event, Length, Task as Command, event, keyboard};
-use iced_layershell::application;
+use iced_layershell::build_pattern::daemon;
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
-use iced_layershell::settings::{LayerShellSettings, Settings};
+use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 use iced_layershell::to_layer_message;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock, mpsc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,8 +18,7 @@ const SOCKET_NAME: &str = "rust-app-menu.sock";
 static SHOW_RX: OnceLock<Mutex<mpsc::Receiver<()>>> = OnceLock::new();
 
 fn socket_path() -> String {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| "/tmp".to_string());
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
     format!("{}/{}", runtime_dir, SOCKET_NAME)
 }
 
@@ -61,6 +62,28 @@ async fn listen_for_show(sender: mpsc::Sender<()>) {
     }
 }
 
+fn parse_hyprctl_focused_monitor(json: &str) -> Option<String> {
+    let focused_block = json
+        .split('{')
+        .find(|block| block.contains("\"focused\": true") || block.contains("\"focused\":true"))?;
+    let name_start = focused_block.find("\"name\":")?;
+    let after = focused_block[name_start + 7..].trim_start();
+    let after = after.strip_prefix('"')?;
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+fn parse_sway_focused_output(json: &str) -> Option<String> {
+    let focused_block = json
+        .split('{')
+        .find(|block| block.contains("\"focused\": true") || block.contains("\"focused\":true"))?;
+    let name_start = focused_block.find("\"name\":")?;
+    let after = focused_block[name_start + 7..].trim_start();
+    let after = after.strip_prefix('"')?;
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
 // --- Styles ---
 
 fn container_style(_theme: &iced::Theme) -> container::Style {
@@ -69,7 +92,12 @@ fn container_style(_theme: &iced::Theme) -> container::Style {
         border: iced::Border {
             color: Color::from_rgba(1.0, 1.0, 1.0, 0.1),
             width: 1.0,
-            radius: 18.0.into(),
+            radius: iced::border::Radius {
+                top_left: 0.0,
+                top_right: 0.0,
+                bottom_left: 18.0,
+                bottom_right: 18.0,
+            },
         },
         ..Default::default()
     }
@@ -186,7 +214,10 @@ fn parse_desktop_file(path: &PathBuf) -> Option<App> {
         return None;
     }
 
-    Some(App { name: name?, exec: exec? })
+    Some(App {
+        name: name?,
+        exec: exec?,
+    })
 }
 
 fn clean_exec(exec: &str) -> String {
@@ -197,10 +228,7 @@ fn clean_exec(exec: &str) -> String {
 }
 
 fn launch(exec: &str) {
-    let _ = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(exec)
-        .spawn();
+    let _ = std::process::Command::new("sh").arg("-c").arg(exec).spawn();
 }
 
 // --- App state ---
@@ -209,45 +237,12 @@ struct Launcher {
     query: String,
     all_apps: Vec<App>,
     visible: bool,
+    known_ids: RefCell<Vec<WindowId>>,
 }
 
-impl Launcher {
-    fn new() -> (Self, Command<Message>) {
-        let (tx, rx) = mpsc::channel();
-        SHOW_RX.set(Mutex::new(rx)).ok();
+// --- Message ---
 
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(listen_for_show(tx));
-        });
-
-        let state = Self {
-            query: String::new(),
-            all_apps: load_apps(),
-            visible: true,
-        };
-        (state, Command::none())
-    }
-
-    fn filtered(&self) -> Vec<&App> {
-        if self.query.is_empty() {
-            self.all_apps.iter().collect()
-        } else {
-            let q = self.query.to_lowercase();
-            self.all_apps
-                .iter()
-                .filter(|a| a.name.to_lowercase().contains(&q))
-                .collect()
-        }
-    }
-}
-
-// --- Iced ---
-
-#[to_layer_message]
+#[to_layer_message(multi)]
 #[derive(Debug, Clone)]
 enum Message {
     QueryChanged(String),
@@ -257,63 +252,93 @@ enum Message {
     Show,
 }
 
+// --- Standalone functions ---
+
 fn namespace() -> String {
     String::from("Launcher")
 }
 
-fn subscription(_: &Launcher) -> iced::Subscription<Message> {
-    let event_sub = event::listen().map(Message::IcedEvent);
+fn new() -> (Launcher, Command<Message>) {
+    let (tx, rx) = mpsc::channel();
+    SHOW_RX.set(Mutex::new(rx)).ok();
 
-    let show_sub = iced::Subscription::run(|| {
-    iced::stream::channel(
-        1,
-        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-            loop {
-                // Use a oneshot to bridge blocking recv into async
-                let (tx, rx) = iced::futures::channel::oneshot::channel();
-                std::thread::spawn(move || {
-                    let got = SHOW_RX
-                        .get()
-                        .map(|rx| rx.lock().unwrap().recv().is_ok())
-                        .unwrap_or(false);
-                    let _ = tx.send(got);
-                });
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(listen_for_show(tx));
+    });
 
-                if rx.await.unwrap_or(false) {
-                    eprintln!("[sub] Got show signal, sending Message::Show");
-                    let _ = output.send(Message::Show).await;
-                }
-            }
-        },
-    )
-});
+    let state = Launcher {
+        query: String::new(),
+        all_apps: load_apps(),
+        visible: false,
+        known_ids: RefCell::new(Vec::new()),
+    };
+    (state, Command::none())
+}
 
-    iced::Subscription::batch([event_sub, show_sub])
+fn all_ids_hide(launcher: &Launcher) -> Command<Message> {
+    let cmds: Vec<Command<Message>> = launcher
+        .known_ids
+        .borrow()
+        .iter()
+        .flat_map(|&id| {
+            [
+                Command::done(Message::AnchorSizeChange {
+                    id,
+                    anchor: Anchor::empty(),
+                    size: (1, 1),
+                }),
+                Command::done(Message::KeyboardInteractivityChange {
+                    id,
+                    keyboard_interactivity: KeyboardInteractivity::None,
+                }),
+            ]
+        })
+        .collect();
+    Command::batch(cmds)
+}
+
+fn all_ids_show(launcher: &Launcher) -> Command<Message> {
+    let cmds: Vec<Command<Message>> = launcher
+        .known_ids
+        .borrow()
+        .iter()
+        .flat_map(|&id| {
+            [
+                Command::done(Message::AnchorSizeChange {
+                    id,
+                    anchor: Anchor::Top,
+                    size: (600, 400),
+                }),
+                Command::done(Message::KeyboardInteractivityChange {
+                    id,
+                    keyboard_interactivity: KeyboardInteractivity::Exclusive,
+                }),
+            ]
+        })
+        .collect();
+    Command::batch(cmds)
 }
 
 fn update(launcher: &mut Launcher, message: Message) -> Command<Message> {
     match message {
         Message::Show => {
-            eprintln!("[iced] Show signal received, making visible");
-            launcher.visible = true;
+            eprintln!("[iced] Show signal received");
             launcher.query.clear();
-            Command::batch([
-                Command::done(Message::AnchorSizeChange(Anchor::empty(), (600, 400))),
-                Command::done(Message::KeyboardInteractivityChange(KeyboardInteractivity::Exclusive)),
-            ])
+            launcher.visible = true;
+            all_ids_show(launcher)
         }
 
         Message::IcedEvent(Event::Keyboard(keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(Named::Escape),
             ..
         })) => {
-            eprintln!("[iced] Hiding, sending AnchorSizeChange 1x1");
-            launcher.visible = false;
             launcher.query.clear();
-            Command::batch([
-                Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1))),
-                Command::done(Message::KeyboardInteractivityChange(KeyboardInteractivity::None)),
-            ])
+            launcher.visible = false;
+            all_ids_hide(launcher)
         }
 
         Message::IcedEvent(Event::Keyboard(keyboard::Event::KeyPressed {
@@ -322,12 +347,9 @@ fn update(launcher: &mut Launcher, message: Message) -> Command<Message> {
         })) => {
             if let Some(app) = launcher.filtered().first() {
                 launch(&app.exec.clone());
-                launcher.visible = false;
                 launcher.query.clear();
-                return Command::batch([
-                    Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1))),
-                    Command::done(Message::KeyboardInteractivityChange(KeyboardInteractivity::None)),
-                ]);
+                launcher.visible = false;
+                return all_ids_hide(launcher);
             }
             Command::none()
         }
@@ -357,28 +379,30 @@ fn update(launcher: &mut Launcher, message: Message) -> Command<Message> {
 
         Message::Launch(exec) => {
             launch(&exec);
-            launcher.visible = false;
             launcher.query.clear();
-            Command::batch([
-                Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1))),
-                Command::done(Message::KeyboardInteractivityChange(KeyboardInteractivity::None)),
-            ])
+            launcher.visible = false;
+            all_ids_hide(launcher)
         }
 
         Message::Close => {
-            launcher.visible = false;
             launcher.query.clear();
-            Command::batch([
-                Command::done(Message::AnchorSizeChange(Anchor::empty(), (1, 1))),
-                Command::done(Message::KeyboardInteractivityChange(KeyboardInteractivity::None)),
-            ])
+            launcher.visible = false;
+            all_ids_hide(launcher)
         }
 
         _ => unreachable!(),
     }
 }
 
-fn view(launcher: &Launcher) -> Element<Message> {
+fn view(launcher: &Launcher, id: WindowId) -> Element<Message> {
+    // Register this window id the first time view is called for it
+    {
+        let mut ids = launcher.known_ids.borrow_mut();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+
     if !launcher.visible {
         return container(column![])
             .width(Length::Fixed(1.0))
@@ -388,17 +412,15 @@ fn view(launcher: &Launcher) -> Element<Message> {
 
     let results = launcher.filtered();
 
-    let list = scrollable(
-        results.iter().fold(column![].spacing(10), |col, app| {
-            col.push(
-                button(text(&app.name))
-                    .on_press(Message::Launch(app.exec.clone()))
-                    .style(button_style)
-                    .width(Length::Fill)
-                    .padding([10, 20]),
-            )
-        }),
-    )
+    let list = scrollable(results.iter().fold(column![].spacing(10), |col, app| {
+        col.push(
+            button(text(&app.name))
+                .on_press(Message::Launch(app.exec.clone()))
+                .style(button_style)
+                .width(Length::Fill)
+                .padding([10, 20]),
+        )
+    }))
     .height(Length::Fill);
 
     let content = column![
@@ -422,6 +444,48 @@ fn view(launcher: &Launcher) -> Element<Message> {
         .into()
 }
 
+fn subscription(_launcher: &Launcher) -> iced::Subscription<Message> {
+    let event_sub = event::listen().map(Message::IcedEvent);
+
+    let show_sub = iced::Subscription::run(|| {
+        iced::stream::channel(
+            1,
+            |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+                loop {
+                    let (tx, rx) = iced::futures::channel::oneshot::channel();
+                    std::thread::spawn(move || {
+                        let got = SHOW_RX
+                            .get()
+                            .map(|rx| rx.lock().unwrap().recv().is_ok())
+                            .unwrap_or(false);
+                        let _ = tx.send(got);
+                    });
+                    if rx.await.unwrap_or(false) {
+                        eprintln!("[sub] Got show signal, sending Message::Show");
+                        let _ = output.send(Message::Show).await;
+                    }
+                }
+            },
+        )
+    });
+
+    iced::Subscription::batch([event_sub, show_sub])
+}
+
+impl Launcher {
+    fn filtered(&self) -> Vec<&App> {
+        if self.query.is_empty() {
+            self.all_apps.iter().collect()
+        } else {
+            let q = self.query.to_lowercase();
+            self.all_apps
+                .iter()
+                .filter(|a| a.name.to_lowercase().contains(&q))
+                .collect()
+        }
+    }
+}
+
 fn main() -> Result<(), iced_layershell::Error> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -432,16 +496,17 @@ fn main() -> Result<(), iced_layershell::Error> {
         return Ok(());
     }
 
-    application(Launcher::new, namespace, update, view)
+    daemon(new, namespace, update, view)
         .style(window_style)
         .subscription(subscription)
         .settings(Settings {
             layer_settings: LayerShellSettings {
-                size: Some((600, 400)),
+                size: Some((1, 1)),
                 anchor: Anchor::empty(),
                 exclusive_zone: 0,
                 layer: Layer::Overlay,
-                keyboard_interactivity: KeyboardInteractivity::Exclusive,
+                keyboard_interactivity: KeyboardInteractivity::None,
+                start_mode: StartMode::AllScreens,
                 ..Default::default()
             },
             ..Default::default()
