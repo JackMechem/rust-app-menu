@@ -3,7 +3,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const SOCKET_NAME: &str = "rust-app-menu.sock";
 
-pub static SHOW_RX: OnceLock<Mutex<mpsc::Receiver<()>>> = OnceLock::new();
+#[derive(Debug)]
+pub enum DaemonCommand {
+    Show,
+    Reload,
+}
+
+pub static DAEMON_RX: OnceLock<Mutex<mpsc::Receiver<DaemonCommand>>> = OnceLock::new();
 
 pub fn socket_path() -> String {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
@@ -17,18 +23,24 @@ pub async fn is_running() -> bool {
 pub async fn try_show_existing() -> bool {
     match tokio::net::UnixStream::connect(socket_path()).await {
         Ok(mut conn) => {
-            eprintln!("[client] Found existing instance, sending show signal");
             let _ = conn.write_all(b"show").await;
             true
         }
-        Err(e) => {
-            eprintln!("[client] No existing instance ({}), starting daemon", e);
-            false
-        }
+        Err(_) => false,
     }
 }
 
-pub async fn listen_for_show(sender: mpsc::Sender<()>) {
+pub async fn try_reload_existing() -> bool {
+    match tokio::net::UnixStream::connect(socket_path()).await {
+        Ok(mut conn) => {
+            let _ = conn.write_all(b"reload").await;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+pub async fn listen_for_commands(sender: mpsc::Sender<DaemonCommand>) {
     let path = socket_path();
     let _ = std::fs::remove_file(&path);
 
@@ -41,14 +53,18 @@ pub async fn listen_for_show(sender: mpsc::Sender<()>) {
         }
     };
 
-    eprintln!("[daemon] Listening for show signals...");
+    eprintln!("[daemon] Listening for commands...");
     loop {
         if let Ok((mut conn, _)) = listener.accept().await {
-            eprintln!("[daemon] Got connection");
             let mut buf = [0u8; 8];
-            if conn.read(&mut buf).await.is_ok() {
-                eprintln!("[daemon] Received show signal, notifying iced");
-                let _ = sender.send(());
+            if let Ok(n) = conn.read(&mut buf).await {
+                let cmd_str = std::str::from_utf8(&buf[..n]).unwrap_or("").trim();
+                let cmd = match cmd_str {
+                    "reload" => DaemonCommand::Reload,
+                    _ => DaemonCommand::Show,
+                };
+                eprintln!("[daemon] Received command: {:?}", cmd);
+                let _ = sender.send(cmd);
             }
         }
     }

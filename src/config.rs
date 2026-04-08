@@ -1,23 +1,38 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use iced::Color;
 use iced_layershell::reexport::Anchor;
 use serde::Deserialize;
 
 static CONFIG_PATH: OnceLock<String> = OnceLock::new();
-static CONFIG: OnceLock<Config> = OnceLock::new();
+static CONFIG: RwLock<Option<Arc<Config>>> = RwLock::new(None);
 
 pub fn set_path(path: String) {
     CONFIG_PATH.set(path).ok();
 }
 
-pub fn get() -> &'static Config {
-    CONFIG.get_or_init(Config::load)
+pub fn get() -> Arc<Config> {
+    {
+        let r = CONFIG.read().unwrap();
+        if let Some(cfg) = r.as_ref() {
+            return Arc::clone(cfg);
+        }
+    }
+    let mut w = CONFIG.write().unwrap();
+    if w.is_none() {
+        *w = Some(Arc::new(Config::load()));
+    }
+    Arc::clone(w.as_ref().unwrap())
+}
+
+pub fn reload() {
+    let mut w = CONFIG.write().unwrap();
+    *w = Some(Arc::new(Config::load()));
 }
 
 // ── top-level ────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, Clone)]
 #[serde(default)]
 pub struct Config {
     pub window: WindowConfig,
@@ -50,7 +65,7 @@ fn config_path() -> String {
 
 // ── window ───────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct WindowConfig {
     /// center | top | bottom | left | right
@@ -70,7 +85,7 @@ impl Default for WindowConfig {
     }
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum AnchorPosition {
     Center,
@@ -106,7 +121,7 @@ impl AnchorPosition {
 
 // ── style ────────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct StyleConfig {
     pub container_background: String,

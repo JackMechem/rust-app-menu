@@ -9,7 +9,7 @@ use iced::{Alignment, Element, Event, Length, Task as Command, event, keyboard};
 use iced_layershell::reexport::KeyboardInteractivity;
 use iced_layershell::to_layer_message;
 
-use crate::daemon::{SHOW_RX, listen_for_show};
+use crate::daemon::{DAEMON_RX, DaemonCommand, listen_for_commands};
 use crate::data::{App, launch, load_apps};
 use crate::styles::{button_style, button_style_selected, container_style, input_style};
 
@@ -49,6 +49,7 @@ pub enum Message {
     Launch(String),
     Close,
     Show,
+    Reload,
 }
 
 pub fn namespace() -> String {
@@ -59,13 +60,13 @@ pub fn new() -> (Launcher, Command<Message>) {
     let cmd = match run_mode() {
         RunMode::Daemon => {
             let (tx, rx) = mpsc::channel();
-            SHOW_RX.set(std::sync::Mutex::new(rx)).ok();
+            DAEMON_RX.set(std::sync::Mutex::new(rx)).ok();
             std::thread::spawn(move || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap()
-                    .block_on(listen_for_show(tx));
+                    .block_on(listen_for_commands(tx));
             });
             Command::none()
         }
@@ -110,6 +111,7 @@ fn all_ids_hide(launcher: &Launcher) -> Command<Message> {
 fn all_ids_show(launcher: &Launcher, height: u32) -> Command<Message> {
     let cfg = crate::config::get();
     let anchor = cfg.window.anchor.to_anchor();
+    let margin = cfg.window.anchor.to_margin(cfg.window.margin);
     let width = cfg.window.width;
     let cmds: Vec<Command<Message>> = launcher
         .known_ids
@@ -122,6 +124,7 @@ fn all_ids_show(launcher: &Launcher, height: u32) -> Command<Message> {
                     anchor,
                     size: (width, height),
                 }),
+                Command::done(Message::MarginChange { id, margin }),
                 Command::done(Message::KeyboardInteractivityChange {
                     id,
                     keyboard_interactivity: KeyboardInteractivity::Exclusive,
@@ -252,6 +255,12 @@ pub fn update(launcher: &mut Launcher, message: Message) -> Command<Message> {
 
         Message::Close => do_close(launcher),
 
+        Message::Reload => {
+            crate::config::reload();
+            launcher.all_apps = load_apps();
+            Command::none()
+        }
+
         _ => unreachable!(),
     }
 }
@@ -335,14 +344,17 @@ pub fn subscription(_launcher: &Launcher) -> iced::Subscription<Message> {
                 loop {
                     let (tx, rx) = iced::futures::channel::oneshot::channel();
                     std::thread::spawn(move || {
-                        let got = SHOW_RX
+                        let cmd = DAEMON_RX
                             .get()
-                            .map(|rx| rx.lock().unwrap().recv().is_ok())
-                            .unwrap_or(false);
-                        let _ = tx.send(got);
+                            .and_then(|rx| rx.lock().unwrap().recv().ok());
+                        let _ = tx.send(cmd);
                     });
-                    if rx.await.unwrap_or(false) {
-                        let _ = output.send(Message::Show).await;
+                    if let Ok(Some(cmd)) = rx.await {
+                        let msg = match cmd {
+                            DaemonCommand::Show => Message::Show,
+                            DaemonCommand::Reload => Message::Reload,
+                        };
+                        let _ = output.send(msg).await;
                     }
                 }
             },

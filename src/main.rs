@@ -16,19 +16,30 @@ use styles::window_style;
 struct Args {
     help: bool,
     daemon_mode: bool,
+    daemon_show: bool,
     show: bool,
+    reload: bool,
     config: Option<String>,
 }
 
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let mut args = Args { help: false, daemon_mode: false, show: false, config: None };
+    let mut args = Args {
+        help: false,
+        daemon_mode: false,
+        daemon_show: false,
+        show: false,
+        reload: false,
+        config: None,
+    };
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
             "--help" | "-h" => args.help = true,
             "--daemon" | "-d" => args.daemon_mode = true,
+            "--daemon-show" | "-ds" => args.daemon_show = true,
             "--show" | "-s" => args.show = true,
+            "--reload" | "-r" => args.reload = true,
             "--config" | "-c" => {
                 i += 1;
                 match argv.get(i) {
@@ -58,8 +69,10 @@ Options:
   -h, --help           Show this help message and exit
   -c, --config PATH    Use a custom config file
                        (default: $XDG_CONFIG_HOME/rust-app-menu/config.toml)
-  -d, --daemon         Run as a background daemon, listening for --show signals
+  -d, --daemon         Run as a background daemon, listening for signals
+  -ds, --daemon-show   If the daemon is running, show the window; otherwise start the daemon
   -s, --show           Send a show signal to a running daemon
+  -r, --reload         Tell the running daemon to reload its config and app list
 
 When launched with no arguments the menu opens as a one-shot window using the
 default config location. Press Escape or launch an app to close it."
@@ -85,6 +98,15 @@ fn main() -> Result<(), iced_layershell::Error> {
         .build()
         .unwrap();
 
+    // --reload: tell the running daemon to reread config and app list, then exit
+    if args.reload {
+        if !rt.block_on(crate::daemon::try_reload_existing()) {
+            eprintln!("Error: no daemon is running. Start one with --daemon.");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // --show: signal the running daemon and exit
     if args.show {
         if !rt.block_on(crate::daemon::try_show_existing()) {
@@ -94,8 +116,15 @@ fn main() -> Result<(), iced_layershell::Error> {
         return Ok(());
     }
 
-    // --daemon: start the background daemon (error if one is already running)
-    if args.daemon_mode {
+    // --daemon-show: show if running, otherwise start the daemon
+    if args.daemon_show {
+        if rt.block_on(crate::daemon::is_running()) {
+            rt.block_on(crate::daemon::try_show_existing());
+            return Ok(());
+        }
+        app::RUN_MODE.set(RunMode::Daemon).ok();
+    } else if args.daemon_mode {
+        // --daemon: start the background daemon (error if one is already running)
         if rt.block_on(crate::daemon::is_running()) {
             eprintln!("Error: a daemon is already running.");
             std::process::exit(1);
